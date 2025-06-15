@@ -1,0 +1,547 @@
+"""
+Продвинутый скрипт для свапа токенов через Uniswap UniversalRouter
+С использованием uniswap-universal-router-decoder для правильного кодирования
+"""
+
+import os
+import time
+from decimal import Decimal
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
+
+from web3 import Web3
+from eth_account import Account
+from dotenv import load_dotenv
+import requests
+
+# Импорты для работы с UniversalRouter (требует установки библиотек)
+try:
+    from uniswap_universal_router_decoder import (
+        FunctionRecipient,
+        RouterCodec,
+        encode_v3_swap
+    )
+
+    ROUTER_DECODER_AVAILABLE = True
+except ImportError:
+    print("⚠️  Библиотека uniswap-universal-router-decoder не установлена")
+    print("Установите: pip install uniswap-universal-router-decoder")
+    ROUTER_DECODER_AVAILABLE = False
+
+
+@dataclass
+class SwapParams:
+    """Параметры для свапа"""
+    token_in: str
+    token_out: str
+    amount_in: int
+    amount_out_min: int
+    recipient: str
+    deadline: int
+    fee: int = 3000  # 0.3% комиссия пула
+
+
+class AdvancedUniswapSwapper:
+    """Продвинутый класс для выполнения свапов через UniversalRouter"""
+
+    def __init__(self, private_key: str, rpc_url: str, chain_id: int = 1):
+        load_dotenv()
+
+        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        self.account = Account.from_key(private_key)
+        self.chain_id = chain_id
+
+        # Проверяем подключение
+        if not self.w3.is_connected():
+            raise ConnectionError("Не удалось подключиться к RPC")
+
+        print(f"✅ Подключен к сети {chain_id}")
+        print(f"📍 Адрес кошелька: {self.account.address}")
+        print(f"💰 Баланс ETH: {self.w3.from_wei(self.w3.eth.get_balance(self.account.address), 'ether'):.4f}")
+
+        # Адреса контрактов
+        self.contracts = self._get_contract_addresses()
+
+        # ABI контрактов
+        self.erc20_abi = self._get_erc20_abi()
+        self.universal_router_abi = self._get_universal_router_abi()
+
+        # Инициализируем контракт UniversalRouter
+        self.universal_router = self.w3.eth.contract(
+            address=self.contracts['universal_router'],
+            abi=self.universal_router_abi
+        )
+
+    def _get_contract_addresses(self) -> Dict[str, str]:
+        """Возвращает адреса контрактов для текущей сети"""
+        contracts = {
+            1: {  # Ethereum
+                'universal_router': '0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD',
+                'permit2': '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+                'weth': '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+                'quoter_v2': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e'
+            },
+            137: {  # Polygon
+                'universal_router': '0xec7BE89e9d109e7e3Fec59c222CF297125FEFda2',
+                'permit2': '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+                'weth': '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270',
+                'quoter_v2': '0x61fFE014bA17989E743c5F6cB21bF9697530B21e'
+            }
+        }
+
+        return contracts.get(self.chain_id, contracts[1])
+
+    def _get_erc20_abi(self) -> List[Dict]:
+        """Возвращает ABI для ERC20 токенов"""
+        return [
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "decimals",
+                "outputs": [{"name": "", "type": "uint8"}],
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "symbol",
+                "outputs": [{"name": "", "type": "string"}],
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [{"name": "_owner", "type": "address"}],
+                "name": "balanceOf",
+                "outputs": [{"name": "balance", "type": "uint256"}],
+                "type": "function"
+            },
+            {
+                "constant": False,
+                "inputs": [
+                    {"name": "_spender", "type": "address"},
+                    {"name": "_value", "type": "uint256"}
+                ],
+                "name": "approve",
+                "outputs": [{"name": "", "type": "bool"}],
+                "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [
+                    {"name": "_owner", "type": "address"},
+                    {"name": "_spender", "type": "address"}
+                ],
+                "name": "allowance",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "type": "function"
+            }
+        ]
+
+    def _get_universal_router_abi(self) -> List[Dict]:
+        """Возвращает ABI для UniversalRouter"""
+        return [
+            {
+                "inputs": [
+                    {"name": "commands", "type": "bytes"},
+                    {"name": "inputs", "type": "bytes[]"},
+                    {"name": "deadline", "type": "uint256"}
+                ],
+                "name": "execute",
+                "outputs": [],
+                "stateMutability": "payable",
+                "type": "function"
+            }
+        ]
+
+    def get_token_info(self, token_address: str) -> Optional[Dict[str, Any]]:
+        """Получает детальную информацию о токене"""
+        try:
+            contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(token_address),
+                abi=self.erc20_abi
+            )
+
+            symbol = contract.functions.symbol().call()
+            decimals = contract.functions.decimals().call()
+            balance = contract.functions.balanceOf(self.account.address).call()
+
+            # Проверяем allowance для Permit2
+            allowance = contract.functions.allowance(
+                self.account.address,
+                self.contracts['permit2']
+            ).call()
+
+            return {
+                'address': token_address,
+                'symbol': symbol,
+                'decimals': decimals,
+                'balance': balance,
+                'balance_formatted': balance / (10 ** decimals),
+                'allowance': allowance,
+                'allowance_formatted': allowance / (10 ** decimals)
+            }
+
+        except Exception as e:
+            print(f"❌ Ошибка получения информации о токене {token_address}: {e}")
+            return None
+
+    def get_quote_from_quoter(self, token_in: str, token_out: str,
+                              amount_in: int, fee: int = 3000) -> Optional[int]:
+        """
+        Получает котировку напрямую от Quoter V2 контракта
+        """
+        try:
+            quoter_abi = [
+                {
+                    "inputs": [
+                        {"name": "tokenIn", "type": "address"},
+                        {"name": "tokenOut", "type": "address"},
+                        {"name": "fee", "type": "uint24"},
+                        {"name": "amountIn", "type": "uint256"},
+                        {"name": "sqrtPriceLimitX96", "type": "uint160"}
+                    ],
+                    "name": "quoteExactInputSingle",
+                    "outputs": [
+                        {"name": "amountOut", "type": "uint256"},
+                        {"name": "sqrtPriceX96After", "type": "uint160"},
+                        {"name": "initializedTicksCrossed", "type": "uint32"},
+                        {"name": "gasEstimate", "type": "uint256"}
+                    ],
+                    "stateMutability": "nonpayable",
+                    "type": "function"
+                }
+            ]
+
+            quoter_contract = self.w3.eth.contract(
+                address=self.contracts['quoter_v2'],
+                abi=quoter_abi
+            )
+
+            result = quoter_contract.functions.quoteExactInputSingle(
+                token_in,
+                token_out,
+                fee,
+                amount_in,
+                0  # sqrtPriceLimitX96 = 0 (no limit)
+            ).call()
+
+            return result[0]  # amountOut
+
+        except Exception as e:
+            print(f"❌ Ошибка получения котировки от Quoter: {e}")
+            return None
+
+    def approve_token_for_permit2(self, token_address: str, amount: int) -> bool:
+        """Одобряет токен для использования с Permit2"""
+        try:
+            contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(token_address),
+                abi=self.erc20_abi
+            )
+
+            # Проверяем текущий allowance
+            current_allowance = contract.functions.allowance(
+                self.account.address,
+                self.contracts['permit2']
+            ).call()
+
+            if current_allowance >= amount:
+                print(f"✅ Токен уже одобрен (allowance: {current_allowance})")
+                return True
+
+            print(f"🔄 Одобряем токен для Permit2...")
+
+            # Строим транзакцию одобрения
+            tx_data = contract.functions.approve(
+                self.contracts['permit2'],
+                2 ** 256 - 1  # Максимальное одобрение
+            ).build_transaction({
+                'from': self.account.address,
+                'gas': 100000,
+                'gasPrice': self.w3.eth.gas_price,
+                'nonce': self.w3.eth.get_transaction_count(self.account.address)
+            })
+
+            # Подписываем и отправляем
+            signed_tx = self.account.sign_transaction(tx_data)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+
+            print(f"📤 Транзакция одобрения отправлена: {tx_hash.hex()}")
+
+            # Ждем подтверждения
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+
+            if receipt.status == 1:
+                print("✅ Токен успешно одобрен для Permit2")
+                return True
+            else:
+                print("❌ Транзакция одобрения не удалась")
+                return False
+
+        except Exception as e:
+            print(f"❌ Ошибка при одобрении токена: {e}")
+            return False
+
+    def build_swap_commands(self, swap_params: SwapParams) -> tuple:
+        """
+        Строит команды для UniversalRouter
+        Использует библиотеку uniswap-universal-router-decoder если доступна
+        """
+        if not ROUTER_DECODER_AVAILABLE:
+            print("❌ Библиотека router decoder недоступна, используем упрощенное кодирование")
+            return self._build_simple_swap_commands(swap_params)
+
+        try:
+            # Используем библиотеку для правильного кодирования команд
+            commands = []
+            inputs = []
+
+            # Команда V3_SWAP_EXACT_IN (0x00)
+            command = 0x00
+            commands.append(command)
+
+            # Кодируем параметры свапа
+            swap_input = encode_v3_swap(
+                recipient=FunctionRecipient.SENDER,  # Отправляем на адрес инициатора
+                amount_in=swap_params.amount_in,
+                amount_out_min=swap_params.amount_out_min,
+                path=self._encode_path(
+                    swap_params.token_in,
+                    swap_params.fee,
+                    swap_params.token_out
+                ),
+                payer_is_sender=True
+            )
+            inputs.append(swap_input)
+
+            # Преобразуем команды в bytes
+            commands_bytes = bytes(commands)
+
+            return commands_bytes, inputs
+
+        except Exception as e:
+            print(f"❌ Ошибка при кодировании команд: {e}")
+            return self._build_simple_swap_commands(swap_params)
+
+    def _build_simple_swap_commands(self, swap_params: SwapParams) -> tuple:
+        """Упрощенное построение команд (фоллбэк)"""
+        # V3_SWAP_EXACT_IN команда
+        commands = bytes([0x00])
+
+        # Простое кодирование входных данных
+        # В реальности требуется более сложная логика
+        swap_data = self.w3.eth.abi.encode(
+            ['address', 'uint256', 'uint256', 'bytes', 'bool'],
+            [
+                swap_params.recipient,
+                swap_params.amount_in,
+                swap_params.amount_out_min,
+                self._encode_path_simple(
+                    swap_params.token_in,
+                    swap_params.fee,
+                    swap_params.token_out
+                ),
+                False  # unwrapWETH
+            ]
+        )
+
+        return commands, [swap_data]
+
+    def _encode_path(self, token_a: str, fee: int, token_b: str) -> bytes:
+        """Кодирует путь для V3 свапа (token -> fee -> token)"""
+        # Путь в V3: tokenA (20 bytes) + fee (3 bytes) + tokenB (20 bytes)
+        path = (
+                bytes.fromhex(token_a[2:]) +  # Убираем 0x
+                fee.to_bytes(3, 'big') +  # Комиссия в 3 байтах
+                bytes.fromhex(token_b[2:])  # Убираем 0x
+        )
+        return path
+
+    def _encode_path_simple(self, token_a: str, fee: int, token_b: str) -> bytes:
+        """Упрощенное кодирование пути"""
+        return self._encode_path(token_a, fee, token_b)
+
+    def execute_swap(self, token_in_address: str, token_out_address: str,
+                     amount_in_human: float, slippage_percent: float = 0.5,
+                     fee: int = 3000) -> bool:
+        """
+        Выполняет свап токенов через UniversalRouter
+
+        Args:
+            token_in_address: Адрес входящего токена
+            token_out_address: Адрес исходящего токена
+            amount_in_human: Количество токенов для свапа
+            slippage_percent: Проскальзывание в процентах
+            fee: Комиссия пула (3000 = 0.3%, 500 = 0.05%, 10000 = 1%)
+        """
+
+        print(f"\n{'=' * 60}")
+        print(f"🔄 НАЧИНАЕМ СВАП ТОКЕНОВ")
+        print(f"{'=' * 60}")
+
+        # Получаем информацию о токенах
+        token_in_info = self.get_token_info(token_in_address)
+        token_out_info = self.get_token_info(token_out_address)
+
+        if not token_in_info or not token_out_info:
+            print("❌ Не удалось получить информацию о токенах")
+            return False
+
+        print(f"📥 Входящий токен: {token_in_info['symbol']} ({token_in_address})")
+        print(f"💰 Баланс: {token_in_info['balance_formatted']:.6f}")
+        print(f"📤 Исходящий токен: {token_out_info['symbol']} ({token_out_address})")
+        print(f"💰 Баланс: {token_out_info['balance_formatted']:.6f}")
+        print(f"📊 Количество для свапа: {amount_in_human}")
+        print(f"📈 Проскальзывание: {slippage_percent}%")
+        print(f"💸 Комиссия пула: {fee / 10000}%")
+
+        # Конвертируем сумму в wei
+        amount_in_wei = int(amount_in_human * (10 ** token_in_info['decimals']))
+
+        if token_in_info['balance'] < amount_in_wei:
+            print(
+                f"❌ Недостаточно токенов! Требуется: {amount_in_human}, доступно: {token_in_info['balance_formatted']:.6f}")
+            return False
+
+        # Одобряем токен для Permit2
+        if not self.approve_token_for_permit2(token_in_address, amount_in_wei):
+            return False
+
+        # Получаем котировку
+        print(f"\n🔍 Получаем котировку...")
+        amount_out = self.get_quote_from_quoter(
+            token_in_address,
+            token_out_address,
+            amount_in_wei,
+            fee
+        )
+
+        if not amount_out:
+            print("❌ Не удалось получить котировку")
+            return False
+
+        amount_out_formatted = amount_out / (10 ** token_out_info['decimals'])
+        print(f"💱 Ожидаемое количество: {amount_out_formatted:.6f} {token_out_info['symbol']}")
+
+        # Рассчитываем минимальную сумму с учетом проскальзывания
+        amount_out_min = int(amount_out * (100 - slippage_percent) / 100)
+        amount_out_min_formatted = amount_out_min / (10 ** token_out_info['decimals'])
+        print(f"📉 Минимальная сумма: {amount_out_min_formatted:.6f} {token_out_info['symbol']}")
+
+        # Строим параметры свапа
+        deadline = int(time.time()) + 1800  # 30 минут
+        swap_params = SwapParams(
+            token_in=token_in_address,
+            token_out=token_out_address,
+            amount_in=amount_in_wei,
+            amount_out_min=amount_out_min,
+            recipient=self.account.address,
+            deadline=deadline,
+            fee=fee
+        )
+
+        # Строим команды для UniversalRouter
+        print(f"\n⚙️  Подготавливаем команды для UniversalRouter...")
+        commands, inputs = self.build_swap_commands(swap_params)
+
+        try:
+            # Строим транзакцию
+            tx_data = self.universal_router.functions.execute(
+                commands,
+                inputs,
+                deadline
+            ).build_transaction({
+                'from': self.account.address,
+                'gas': 300000,  # Увеличиваем лимит газа
+                'gasPrice': int(self.w3.eth.gas_price * 1.1),  # +10% к цене газа
+                'nonce': self.w3.eth.get_transaction_count(self.account.address),
+                'value': 0  # Не отправляем ETH (если не свапаем ETH)
+            })
+
+            # Подписываем транзакцию
+            signed_tx = self.account.sign_transaction(tx_data)
+
+            print(f"\n🚀 ОТПРАВЛЯЕМ ТРАНЗАКЦИЮ СВАПА...")
+            print(f"⛽ Газ: {tx_data['gas']:,}")
+            print(f"💰 Цена газа: {tx_data['gasPrice']:,} wei")
+            print(f"💸 Стоимость газа: {self.w3.from_wei(tx_data['gas'] * tx_data['gasPrice'], 'ether'):.6f} ETH")
+
+            # Отправляем транзакцию
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            print(f"📤 Транзакция отправлена: {tx_hash.hex()}")
+
+            # Ждем подтверждения
+            print(f"⏳ Ожидаем подтверждения...")
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
+
+            if receipt.status == 1:
+                print(f"\n🎉 СВАП УСПЕШНО ВЫПОЛНЕН!")
+                print(f"✅ Хэш транзакции: {tx_hash.hex()}")
+                print(f"⛽ Использовано газа: {receipt.gasUsed:,}")
+
+                # Показываем обновленные балансы
+                print(f"\n📊 ОБНОВЛЕННЫЕ БАЛАНСЫ:")
+                updated_token_in = self.get_token_info(token_in_address)
+                updated_token_out = self.get_token_info(token_out_address)
+
+                if updated_token_in and updated_token_out:
+                    print(f"📥 {updated_token_in['symbol']}: {updated_token_in['balance_formatted']:.6f}")
+                    print(f"📤 {updated_token_out['symbol']}: {updated_token_out['balance_formatted']:.6f}")
+
+                return True
+            else:
+                print(f"❌ Транзакция не удалась")
+                return False
+
+        except Exception as e:
+            print(f"❌ Ошибка при выполнении свапа: {e}")
+            return False
+
+
+def main():
+    """Основная функция для демонстрации"""
+
+    # Загружаем переменные окружения
+    load_dotenv()
+
+    # Получаем конфигурацию
+    private_key = os.getenv('PRIVATE_KEY')
+    rpc_url = os.getenv('RPC_URL', 'https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY')
+
+    if not private_key:
+        print("❌ PRIVATE_KEY не найден в переменных окружения")
+        print("Добавьте в файл .env: PRIVATE_KEY=your_private_key_here")
+        return
+
+    # Примеры токенов (Ethereum Mainnet)
+    USDC = "0xA0b86a33E6442141e26393e5f50c6cf1B740e1de"  # USDC
+    WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+
+    try:
+        # Создаем свапер
+        swapper = AdvancedUniswapSwapper(
+            private_key=private_key,
+            rpc_url=rpc_url,
+            chain_id=1  # Ethereum Mainnet
+        )
+
+        # Выполняем свап: 10 USDC -> WETH
+        success = swapper.execute_swap(
+            token_in_address=USDC,
+            token_out_address=WETH,
+            amount_in_human=10.0,  # 10 USDC
+            slippage_percent=0.5,  # 0.5% проскальзывание
+            fee=3000  # 0.3% комиссия пула
+        )
+
+        if success:
+            print(f"\n🎊 Свап завершен успешно!")
+        else:
+            print(f"\n💥 Свап не удался")
+
+    except Exception as e:
+        print(f"💥 Критическая ошибка: {e}")
+
+
+if __name__ == "__main__":
+    main()
